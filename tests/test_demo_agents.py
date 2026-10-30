@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import re
+import shlex
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -232,3 +234,13 @@ def test_example_treats_a_cut_off_reply_as_an_error(monkeypatch):
     client = FakeClient(stop_reason="max_tokens")
     result = run_bench(module.make_agent(client=client), CORPUS.limited(limit=1))
     assert "cut off" in next(iter(result.baseline.values())).error
+
+
+def test_output_pasted_in_the_readme_is_what_the_cli_prints(capsys):
+    """Numbers in the README must be real output of the fake agents, byte for byte."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"^```\n\$ same-answer (.+?)\n(.*?)^```$", readme, re.M | re.S)
+    assert len(blocks) >= 3
+    for command, printed in blocks:
+        assert main(shlex.split(command)) == 0
+        assert capsys.readouterr().out == printed, command
