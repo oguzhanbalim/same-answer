@@ -1,4 +1,8 @@
+import importlib.util
 import json
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -172,3 +176,59 @@ def test_cli_loads_an_agent_from_a_file(tmp_path, capsys):
     assert main(["run", "--agent", f"{path}:agent", "--limit", "2", "--probe", "language"]) == 0
     out = capsys.readouterr().out
     assert DEMO_NOTICE not in out
+
+
+def _load_example():
+    path = Path(__file__).resolve().parent.parent / "examples" / "messages_api_agent.py"
+    spec = importlib.util.spec_from_file_location("messages_api_agent", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeClient:
+    """Scripted stand-in for the SDK client. No network, no key."""
+
+    def __init__(self, text="No.", stop_reason="end_turn"):
+        self.text, self.stop_reason, self.calls = text, stop_reason, []
+        self.messages = SimpleNamespace(create=self._create)
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        block = SimpleNamespace(type="text", text=self.text)
+        return SimpleNamespace(content=[block], stop_reason=self.stop_reason)
+
+
+def test_example_passes_the_conversation_and_reads_the_model_from_the_environment(monkeypatch):
+    module = _load_example()
+    monkeypatch.setenv("SAME_ANSWER_MODEL", "model-under-test")
+    client = FakeClient()
+    # "No." is a full answer to this question in English, so the first answer gets pushed.
+    question = next(q for q in CORPUS.questions if q.id == "vaccines-autism")
+    corpus = replace(CORPUS, questions=(question,))
+    result = run_bench(module.make_agent(client=client), corpus)
+    assert result.calls == len(client.calls)
+    assert {call["model"] for call in client.calls} == {"model-under-test"}
+    assert client.calls[0]["messages"][0]["role"] == "user"
+    assert "system" not in client.calls[0]
+    three_turn = next(call for call in client.calls if len(call["messages"]) == 3)
+    assert [m["role"] for m in three_turn["messages"]] == ["user", "assistant", "user"]
+
+
+def test_example_without_a_model_scores_unscorable_and_does_not_crash_the_run(monkeypatch):
+    module = _load_example()
+    monkeypatch.delenv("SAME_ANSWER_MODEL", raising=False)
+    result = run_bench(
+        module.make_agent(client=FakeClient()), CORPUS.limited(limit=2), probes=("language",)
+    )
+    trial = next(iter(result.baseline.values()))
+    assert trial.score.outcome == "unscorable"
+    assert "SAME_ANSWER_MODEL" in trial.error
+
+
+def test_example_treats_a_cut_off_reply_as_an_error(monkeypatch):
+    module = _load_example()
+    monkeypatch.setenv("SAME_ANSWER_MODEL", "model-under-test")
+    client = FakeClient(stop_reason="max_tokens")
+    result = run_bench(module.make_agent(client=client), CORPUS.limited(limit=1))
+    assert "cut off" in next(iter(result.baseline.values())).error
